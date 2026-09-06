@@ -1,8 +1,8 @@
 # H3-V100-GGUF-YF
 
-MiniMax H3 的 NVIDIA V100 (SM70) 优化节点 —— **GGUF 支持版（基于官方 v1.1.2）**。
+MiniMax H3 的 NVIDIA V100 (SM70) 优化节点 —— **GGUF 支持版（基于官方 v1.3.x）**。
 
-> ⚠️ **本项目基于 [rwashy/H3-V100](https://github.com/rwashy/H3-V100) v1.1.2 版本修改，原作者：rwashy。感谢原作者的优秀工作！**
+> ⚠️ **本项目基于 [rwashy/H3-V100](https://github.com/rwashy/H3-V100) v1.3.x 基线修改，原作者：rwashy。感谢原作者的优秀工作！**
 
 ## 为什么有这个分支
 
@@ -14,11 +14,11 @@ RuntimeError: H3 V100 requires ComfyUI DynamicVRAM. Remove --disable-dynamic-vra
 
 这意味着 **官方新版（v1.3+）不支持 GGUF 模型**，只支持 int8/混合精度权重。
 
-**而官方 v1.1.2** 没有这个 `is_dynamic` 检查，**天然支持 GGUF**。本分支基于官方 **v1.1.2**，在你的 V100 16G 环境上验证过能用 GGUF 跑通。
+本分支基于官方 **v1.3.x 的代码基线**，**移除了这个 `is_dynamic` 准入检查**，使 GGUF 模型能正常通过；在你的 V100 16G 环境上验证过能用 GGUF 跑通。
 
-## 与官方 v1.1.2 的差异
+## 与官方 v1.3.x 的差异
 
-- **保留 v1.1.2 的 GGUF 兼容性**（无 `is_dynamic` 准入检查）。
+- **基于官方 v1.3.x 基线，移除了 `is_dynamic` 准入检查**，以恢复对 GGUF 模型的兼容。
 - 加入了若干自用的增强/诊断文件（`diagnostics.py`、`sol_route_diagnostics.py`、独立的 `h3_optimize.py` 等）。
 - `.pyd` 为在本机环境（PyTorch 2.10.0 + cu128、CPython 3.12.10）编译的版本。
 

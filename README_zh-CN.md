@@ -2,7 +2,7 @@
 
 简体中文 | [English](README.md)
 
-> ⚠️ **本项目基于 [rwashy/H3-V100](https://github.com/rwashy/H3-V100) v1.1.2 版本修改，原作者：rwashy。感谢原作者的优秀工作！**
+> ⚠️ **本项目基于 [rwashy/H3-V100](https://github.com/rwashy/H3-V100) v1.3.x 基线修改，原作者：rwashy。感谢原作者的优秀工作！**
 
 `H3_V100` 是用于 NVIDIA Tesla V100（SM70）运行 MiniMax H3 的 ComfyUI
 自定义节点。它提供：
