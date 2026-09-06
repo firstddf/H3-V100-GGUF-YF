@@ -6,19 +6,19 @@ MiniMax H3 的 NVIDIA V100 (SM70) 优化节点 —— **GGUF 支持版（基于�
 
 ## 为什么有这个分支
 
-官方 `rwashy/H3-V100` 的 **v1.3.0 / v1.4.0 / v1.4.1** 开始要求传入的模型必须是 **Dynamic ModelPatcher**（`h3_optimize.py` 里有 `is_dynamic` 准入检查），而 **GGUF 加载的模型不是 Dynamic 类型**，会直接报错：
+官方 `rwashy/H3-V100` 的 **v1.4.x** 开始要求传入的模型必须是 **Dynamic ModelPatcher**（`h3_optimize.py` 里新增了 `is_dynamic` 准入检查），而 **GGUF 加载的模型不是 Dynamic 类型**，会直接报错：
 
 ```
 RuntimeError: H3 V100 requires ComfyUI DynamicVRAM. Remove --disable-dynamic-vram and --lowvram, restart ComfyUI, and reload the model.
 ```
 
-这意味着 **官方新版（v1.3+）不支持 GGUF 模型**，只支持 int8/混合精度权重。
+这意味着 **官方新版（v1.4+）不支持 GGUF 模型**，只支持 int8/混合精度权重。
 
-本分支基于官方 **v1.3.x 的代码基线**，**移除了这个 `is_dynamic` 准入检查**，使 GGUF 模型能正常通过；在你的 V100 16G 环境上验证过能用 GGUF 跑通。
+官方 **v1.3.0** 时 `is_dynamic` 检查**尚未引入**，本分支正是基于官方 **v1.3.0 基线**，因此 **GGUF 模型能正常通过**；在你的 V100 16G 环境上验证过能用 GGUF 跑通。
 
 ## 与官方 v1.3.x 的差异
 
-- **基于官方 v1.3.x 基线，移除了 `is_dynamic` 准入检查**，以恢复对 GGUF 模型的兼容。
+- **基于官方 v1.3.0 基线（彼时无 `is_dynamic` 准入检查）**，天然兼容 GGUF 模型。
 - 加入了若干自用的增强/诊断文件（`diagnostics.py`、`sol_route_diagnostics.py`、独立的 `h3_optimize.py` 等）。
 - `.pyd` 为在本机环境（PyTorch 2.10.0 + cu128、CPython 3.12.10）编译的版本。
 
