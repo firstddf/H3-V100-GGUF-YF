@@ -2,6 +2,8 @@
 
 MiniMax H3 的 NVIDIA V100 (SM70) 优化节点 —— **GGUF 支持版（基于官方 v1.1.2）**。
 
+> ⚠️ **本项目基于 [rwashy/H3-V100](https://github.com/rwashy/H3-V100) v1.1.2 版本修改，原作者：rwashy。感谢原作者的优秀工作！**
+
 ## 为什么有这个分支
 
 官方 `rwashy/H3-V100` 的 **v1.3.0 / v1.4.0 / v1.4.1** 开始要求传入的模型必须是 **Dynamic ModelPatcher**（`h3_optimize.py` 里有 `is_dynamic` 准入检查），而 **GGUF 加载的模型不是 Dynamic 类型**，会直接报错：
