@@ -11,15 +11,30 @@
 
 | 结论 | 判定 |
 |---|---|
-| **H3-V100 本体在 ComfyUI 0.35 上工作正常** | ✅ 全部补丁正常挂载；9 次完成运行，唯一 2 次崩溃均由 TE-Speed 造成（见结论三） |
-| **`ModelAttentionBackend`（ComfyUI 内置节点）会静默覆盖本节点的注意力后端** | ⚠️ 每步慢 **20–25%**，必须不要接 |
-| **第三方闭源包 `TE-Speed-MiniMaxH3` 与 0.35 不兼容** | ❌ 内嵌 0.33 版 H3 前向，撞上 0.35 的 `FinalLayer` 签名变更 → **必崩** |
-| **`sol_attn` 在本分支（v1.3.0 build）不可用** | ❌ 该 `.pyd` 未编译 Sol kernel → 静默回退纯 PyTorch 参考实现，**慢 2.55×**。**上游 v2.0 已提供 `h3_v100_sol_cuda.pyd`**（见第 10 节） |
-| **实测最优（0.3MP×10s / 23845 token / 4 步）** | **42.56 s/it**，采样 170s |
-| **实测最优（0.3MP×15s / 34706 token / 4 步）** | **77.31 s/it**，采样 308s |
-| **`capacity_guard_tokens = 31744` 不是总长度上限** | 它只是"单次不分块 MLP 分配"上限；超过即**强制分块**（34706 token 实测照常运行） |
+| **ComfyUI 0.35 没有让 V100-H3 变慢** | ✅ 本节点全部补丁正常挂载；21 次运行中**没有一次**由本节点自身引发故障 |
+| **`ModelAttentionBackend`（ComfyUI 内置节点）静默覆盖本节点注意力后端** | ⚠️ 真因之一：每步 **+20~25%** → **must not connect** |
+| **第三方闭源包 `TE-Speed-MiniMaxH3` 与 0.35 不兼容** | ❌ 真因之二：内嵌 0.33 版 H3 前向 → `FinalLayer` 签名不符 → **必崩**（实测 2 次） |
+| **ComfyUI-Manager 启动抓取会污染测速** | ⚠️ 真因之三：启动后前 ~7 分钟与采样并发，s/it 虚高 **~8%** |
+| **段档（MLP 分块数）不是成本驱动因素** | ❌ 伪因：把段数从 10–14 降到 5，s/it 反升 9%；**该补丁已回滚** |
+| **可用显存 `eff` 也不是成本驱动因素** | ❌ 伪因：`--reserve-vram 1.0` 使 eff +534 MiB，s/it 无改善 |
+| **`sol_attn` 在本分支不可用** | ❌ 该 `.pyd` 未编译 Sol kernel → 静默回退纯 PyTorch → **慢 2.55×**（上游 v2.0 已提供原生实现） |
+| **DynamicVRAM 与 H3_V100 不兼容** | ❌ 与自适应分块 + Comfy Compiler 冲突 → **必崩**（`aimdo memory compile error`） |
+| **`capacity_guard_tokens = 31744` 不是总长度上限** | 只是"单次不分块 MLP 分配"上限，超过即强制分块（34706 token 实测照常运行） |
 
-**一句话**：0.35 升级后"变慢"的主因不是 H3-V100，也不是 0.35 本身，而是**工作流里多接了两个会互相覆盖/不兼容的节点**。拆掉后恢复到当前最优。
+### 各配置实测最优
+
+| 分辨率 × 时长 | token | 4 步 s/it | 采样 | 总时 | 条件 |
+|---|---|---|---|---|---|
+| 0.3 MP × 10 s | 23845 | **42.56** | 170 s | 247 s | flash + 跳 203/222 |
+| 0.5 MP × 5 s | 21181 | 42.77 | 171 s | 356 s | flash（203 在链） |
+| 0.4 MP × 10 s | 31699 | 68.90 | 275 s | 387 s | flash（203 在链） |
+| 0.3 MP × 15 s | 34706 | 77.31 | 308 s | 515 s | flash + 跳 203/222 |
+
+**成本几乎只由 token 数决定**：`s/it ≈ 6.05e-4·N + 4.95e-8·N²`（±5%）。因此**怎么调分辨率/时长，都比"少接一个多余节点"更划算**——删掉 203 一次就省 20~25%。
+
+> **一句话**：这次"0.35 升级后变慢"是**工作流里多接的两个节点**（一个覆盖注意力、一个内嵌旧前向）造成的，外加一个测试环境陷阱（Manager 抓取）。H3-V100 与 0.35 本身没有问题。
+>
+> 全部 21 次运行的逐次数据见 §6，完整结论见 §11。
 
 ---
 
@@ -259,28 +274,43 @@ if native is None:
 
 ## 6. 全部实测数据
 
-| # | 时刻 | token | 段档 | attention | TE-Speed | s/it | 采样 | 总时 |
-|---|---|---|---|---|---|---|---|---|
-| R1 | 19:49 | 16242 | 26×640 | V100 flash | 在链（未激活） | 55.4 | 240s | 779s |
-| R2 | 20:03 | 16242 | 26×640 | V100 flash | 在链（未激活） | 40.7 | 162s | 508.7s |
-| R3 | 20:17 | 30813 | 3×10496 | V100 flash | 在链（未激活） | 66.2 | 264s | 401.4s |
-| R4 | 20:27 | 23845 | 5→6 | **PyTorch（203）** | 在链（未激活） | 55.3 | 221s | 439.4s |
-| R5 | 20:39 | 31699 | 3×10752 | **PyTorch（203）** | 在链（未激活） | 91.8 | 367s | 593.9s |
-| R6 | 20:46 | 31699 | 3×10752 | V100 flash | 在链（未激活） | 68.9 | 275s | 387.3s |
-| R7 | 20:57 | 23845 | 6×4096 | V100 flash | 在链（未激活） | 43.8 | 175s | 346.0s |
-| C1 | 21:01 | 23845 | 5→7 | `sol_attn` | **激活** | — | — | **崩**（56.7s） |
-| C2 | 21:10 | 23845 | 4→5 | V100 flash | **激活** | — | — | **崩**（56.0s） |
-| **R8** | 21:17 | 23845 | **4×6144** | V100 flash | **bypass** | **42.6** | **170s** | **247.2s** |
-| S1 | 21:20 | 23845 | 5×4864 | `sol_attn` | bypass | 108.3 | 433s | 509.7s |
-| **R9** | 21:40 | **34706** | **3×11776** | V100 flash | **bypass** | **77.3** | **308s** | **515.5s** |
+| # | 时刻 | token | 段档 | attention | TE-Speed | s/it | 采样 | 总时 | 备注 |
+|---|---|---|---|---|---|---|---|---|---|
+| R1 | 19:49 | 16242 | 640×26 | V100 flash | 在链（未激活） | 55.38 | 240 s | 779 s | DiT **完全驻留** 11153 MB |
+| R2 | 20:03 | 16242 | 640×26（推） | V100 flash | 在链（未激活） | 40.66 | 162 s | 508.7 s | |
+| R3 | 20:17 | 30813 | 10496×3 | V100 flash | 在链（未激活） | 66.16 | 264 s | 401.4 s | 分辨率未记录 |
+| R4 | 20:27 | 23845 | 4864×5 → 4096×6 | **PyTorch（203）** | 在链（未激活） | 55.34 | 221 s | 439.4 s | 运行中降档 |
+| R5 | 20:39 | 31699 | 10752×3 | **PyTorch（203）** | 在链（未激活） | 91.81 | 367 s | 593.9 s | 0.4 MP 对照（带 203） |
+| **R6** | 20:46 | 31699 | 10752×3 | V100 flash | 在链（未激活） | **68.90** | 275 s | 387.3 s | ← **0.4 MP×10 s 基线** |
+| R7 | 20:57 | 23845 | 4096×6（推） | V100 flash | 在链（未激活） | 43.84 | 175 s | 346.0 s | 跳 203 |
+| C1 | 21:01 | 23845 | 4864×5 → 3584×7 | `sol_attn` | **激活** | — | — | **崩** 56.7 s | `FinalLayer` 签名 |
+| C2 | 21:10 | 23845 | 6144×4 → 4864×5 | V100 flash | **激活** | — | — | **崩** 56.0 s | 同上（证明与 sol 无关） |
+| **R8** | 21:17 | 23845 | **6144×4** | V100 flash | **bypass** | **42.56** | **170 s** | **247.2 s** | ← **全项目最优** |
+| S1 | 21:28 | 23845 | 4864×5 | `sol_attn` | bypass | 108.25 | 433 s | 509.7 s | Sol 走纯 PyTorch 兜底 |
+| **R9** | 21:47 | **34706** | 11776×3 | V100 flash | bypass | **77.31** | 308 s | 515.5 s | **0.3 MP×15 s**，越过 31744 |
+| F1 | — | 21181 | 2304×10 → 1536×14 | V100 flash | 在链（未激活） | 42.77 | 171 s | 356.2 s | **0.5 MP×5 s（改动前对照）** |
+| D1 | 22:10 | 23845 | 640×38 | V100 flash | bypass | — | — | **崩** 105.6 s | 开 DynamicVRAM → `aimdo memory compile error` |
+| P1 | 22:26 | 23845 | 6144×4 | V100 flash | bypass | 49.03 | 196 s | 436.3 s | 分段补丁版 · 冷启动 + Manager 抓取 |
+| P2 | 22:35 | 23845 | 6144×4 | V100 flash | bypass | 49.01 | 196 s | 275.3 s | 分段补丁版 · Manager 抓取中 |
+| P3 | 22:42 | 21181 | **4352×5** | V100 flash | bypass | 46.62 | 187 s | 381.5 s | **0.5 MP×5 s（改动后）** |
+| T1 | 22:57 | 23845 | 6144×4 | V100 flash | bypass | 48.47 | 193 s | 434.0 s | `--reserve-vram 1.0` · Manager 抓取中 |
+| **T2** | 23:03 | 23845 | **8192×3 → 6144×4** | V100 flash | bypass | **44.56** | **178 s** | **254.1 s** | `--reserve-vram 1.0` · **Manager 已空闲** |
 
-> ⚠️ **总时不可直接横向比较**：它包含 TE/VAE 装载与编码、解码，且会被 ComfyUI 缓存命中与否污染（实测 `got prompt → DiT 装载` 在 **0.35 s 与 ~99 s** 之间波动）。**判定一律以 s/it 为准。**
+### 6.0 按配置汇总
 
-> R9 的完整时间构成：pre-load（VAE+TE 装载与编码，因时长改变而上游重算）**99.4 s** → DiT 装载 13.4 s → **采样 308 s（60%）** → 解码 92.4 s。
+| 分辨率 × 时长 | token | 运行数 | 段档范围 | **最优 s/it** / 最差 | 采样 | 总时 |
+|---|---|---|---|---|---|---|
+| **0.3 MP × 10 s** | 23845 | 7 | 6144×4 ~ 640×38 | **42.56** / 49.03 | 170–196 s | 247–436 s |
+| **0.5 MP × 5 s** | 21181 | 2 | 4352×5 / 1536×14 | 42.77 / 46.62 | 171–187 s | 356–382 s |
+| **0.4 MP × 10 s** | 31699 | 2 | 10752×3 | **68.90** / 91.81 | 275–367 s | 387–594 s |
+| **0.3 MP × 15 s** | 34706 | 1 | 11776×3 | **77.31** | 308 s | 515 s |
+| （分辨率未记录） | 30813 / 16242 | 3 | 10496×3 / 640×26 | 40.66 / 66.16 | 162–264 s | 401–779 s |
+
+> 上表"总时"含 TE/VAE 装载与编码、VAE 解码，**不可直接横向比较**（实测 `got prompt → DiT 装载` 在 **0.24 s 与 ~99 s** 之间波动）。**判定一律以 s/it 为准**。
 
 > R9 是本报告唯一触发 `selection_reason=balanced_measured_full_limit` 的运行（34706 token 已越过 `capacity_guard_tokens=31744`），说明**该阈值只强制分块，不阻止运行**。
 
-> R2 与 R7 相对同 token 的其它运行偏离较大（+27% / −20%），说明仍有未识别的变量（可能是 token 构成/工作流差异），仅作参考。
+> R9 的完整时间构成：pre-load（VAE+TE 装载与编码，因时长改变而上游重算）**99.4 s** → DiT 装载 13.4 s → **采样 308 s（60%）** → 解码 92.4 s。
 
 ### 6.1 段档（MLP 分块）行为观察
 
@@ -299,38 +329,85 @@ if native is None:
 1. **`_trim_if_needed` 会清掉被计入额度的缓存**（`tokenwise_chunking.py:262` 的 `torch.cuda.synchronize()` + `empty_cache()`）。R4 中 step0→step1：**空闲显存从 865 升到 2947 MiB（+240%），段档却从 5 降到 6** —— 唯一变量是缓存被清掉（2442 → 145.7 MiB）。
 2. **降档不可逆**：`_UPGRADE_STABLE_CALLS=3` 且要求 `budget_tokens >= selected + 1024`，而 `selected` 本身贴着 `budget_tokens` 取整 → 升级门槛结构性难以满足（日志中 `upgrade_candidate=None, upgrade_stable_calls=0/3` 恒定）。
 
-**但段档的时间代价很小**：R7（6 段）43.84 → R8（4 段）42.56，即 **≈0.6–0.8 s/it 每段**。在 42.5 s/it 的量级下，段档这一整个杠杆的上限只有 **≈4%**。因此**不建议**为此改动分块逻辑；仅需留意日志中的 `chunks=` 是否跳到两位数。
+#### ⚠️ 段档与耗时的因果关系：两次改口，最终结论在此
 
-### 6.2 扩展律：token 与耗时的关系（可用于规划）
+| 阶段 | 当时的假说 | 后续验证 |
+|---|---|---|
+| 早期 | "3 段 → 41 s/it"，段档决定 s/it | ❌ **错配**：41 s/it 那对属于 R2（26 段），不是 3 段那次 |
+| 中期 | "崩档（≥10 段）代价可达 20%" | ❌ 用 R6/R8 拟合的模型把**其它效应**（低 eff / Manager 污染）误算进了残差，又归因给段数 |
+| **最终** | **段档不是成本驱动因素** | ✅ 由下面这个受控实验证实 |
 
-0.3 MP 下 token 与时长近似线性：
+**受控实验**：把 `safety_reserve` 改成随可用显存缩放（1638 → 1044~1456 MiB），使 **0.5 MP×5 s** 的段数大幅下降：
+
+| 0.5 MP×5 s（21181 token） | 改动前 | 改动后 |
+|---|---|---|
+| effective_budget | 2748 MiB | 2610 MiB |
+| safety_reserve | 1638.4 | **1044.1** |
+| **段档** | **2304×10 → 2048×11 → 1536×14** | **4352 × 5** |
+| **s/it** | **42.77** | **46.62（+9%）** |
+| 总时 | 356.2 s | 381.5 s |
+
+**段数少了 60%，每步反而慢了 9%**；而这 9% 可由"当时 eff 低 138 MiB"完全解释——把 eff 归一化后，改前/改后落在同一条线上。**该补丁已回滚**（`tokenwise_chunking.py` 恢复原状，插件目录与 git 仓库逐字节一致）。
+
+**仍然成立的机制**（保留，供排查参考）：
+
+1. **`_trim_if_needed` 会清掉被计入额度的缓存**（`tokenwise_chunking.py:262` 的 `torch.cuda.synchronize()` + `empty_cache()`）。R4 step0→step1：空闲显存 865 → 2947 MiB（+240%），段档却从 5 降到 6 —— 唯一变量是缓存被清掉（2442 → 145.7 MiB）。
+2. **eff 抖动会引起段档抖动**：T2 中 eff 4062 → 3723 → 3691，段档随之 8192×3 → 6144×4。
+3. **升级通道是"有条件可用"而非死的**：T2 第一块因上一轮留下 **2974 MiB** allocator 缓存使 `budget_tokens = 9582 ≥ 8192 + 1024`，触发了 `selection_reason=stable_runtime_budget_upgrade`（此前多轮都是 `upgrade_candidate=None`，所以我先前"升级通道结构性不可达"的说法过强）。
+
+### 6.2 成本模型：token 与耗时的关系（可用于规划）
+
+分辨率固定时，**token 与时长近似线性**：
 
 ```
-token ≈ 2145 + 2172 × 秒        # 0.3 MP
-（10 s → 23865，15 s → 34725；实测 23845 / 34706 ✓）
+token ≈ 2145 + 2172 × 秒        # 0.3 MP（10 s → 23865，15 s → 34725；实测 23845 / 34706 ✓）
+token ≈ 2145 + 2955 × 秒        # 0.4 MP
 ```
 
-而每步耗时是**超线性**的。用两个 V100 flash 运行点（31699 → 68.9 s/it、23845 → 43.8 s/it）拟合：
+**每步耗时是超线性的**。用两个干净的 V100 flash 运行点（R6：31699 → 68.90；R8：23845 → 42.56）拟合：
 
 ```
-s/it ≈ 8.22e-4 · N + 4.265e-8 · N²        （N = token）
+s/it ≈ 6.05e-4 · N  +  4.95e-8 · N²          （N = token，±5%）
 ```
 
-在 15 s 运行点上外推得 **79.9 s/it，实测 77.31（误差 −3.2%）**，说明该式在 13k–35k token 区间可用：
-
-| 时长(0.3MP) | token | 预测 s/it | 实测 s/it | 采样 | 注意力占比 |
+| 配置 | token | 预测 s/it | 实测最优 | 偏差 | 采样 |
 |---|---|---|---|---|---|
-| 5 s | ~13005 | 17.9 | — | ~72s | ~40% |
-| 10 s | 23845 | 43.9 | **42.6** | 170s | ~55% |
-| **15 s** | **34706** | **79.9** | **77.3** | **308s** | **~66%** |
-| 20 s | ~45585 | 126 | — | ~504s | ~70% |
+| 0.3 MP × 5 s | ~13005 | 17.9 | — | — | ~72 s |
+| 0.5 MP × 5 s | 21181 | 35.0 | 42.77 | +22%（低 eff / 多段 / 污染） | 171 s |
+| **0.3 MP × 10 s** | 23845 | 42.6 | **42.56** | **0%**（拟合点） | 170 s |
+| **0.4 MP × 10 s** | 31699 | 68.9 | **68.90** | **0%**（拟合点） | 275 s |
+| **0.3 MP × 15 s** | 34706 | 80.6 | **77.31** | −4.1% | 308 s |
+| 0.3 MP × 20 s | ~45585 | 126 | — | — | ~504 s |
+
+**注意力占比**（`c·N²` 项占 s/it 的比例）随长度单调上升：**~40%（13k）→ 55%（24k）→ 66%（35k）→ 70%（46k）**。
 
 **两个可直接用于决策的结论：**
 
-1. **注意力占比随长度单调上升**（40% → 55% → 66% → 70%）。序列越长，稀疏注意力（Sol）的潜在收益越大——本分支因缺原生 kernel 无法利用，而上游 v2.0 的原生实现正是为此准备（见第 10 节）。
-2. **15 s 是 0.3 MP 的性价比拐点**：时长 +50%（10 s → 15 s），采样从 170 s 涨到 308 s（**1.81×**）。再往上二次项将主导。
+1. 序列越长，稀疏注意力（Sol）的潜在收益越大——本分支因缺原生 kernel 无法利用，上游 v2.0 的原生实现正是为此准备（见第 10 节）。
+2. **15 s 是 0.3 MP 的性价比拐点**：时长 +50%（10 s → 15 s），采样 170 → 308 s（**1.81×**）。
 
 > 二次项（`N²`）在 transformer 中只有注意力，因此可由拟合系数直接读出注意力占每步的比例；这也是判定"该不该上稀疏注意力"的依据。
+
+#### 6.2.1 测试环境陷阱：ComfyUI-Manager 启动抓取
+
+启动后约 7 分钟内，ComfyUI-Manager 会抓取 **185 条 registry 条目**，与采样**并发**：
+
+```
+22:49:07  启动
+22:53:30  ─── 采样开始 ─────────────────── 22:56:43 采样结束
+22:55:56  FETCH ComfyRegistry Data [DONE]      ← 抓取跑到采样 ~75% 才结束
+```
+
+| 运行 | Manager 状态 | s/it |
+|---|---|---|
+| T1（22:53） | 正在抓 185 条 | 48.47 |
+| T2（22:59） | `All startup tasks have been completed.` | **44.56** |
+
+**同一配置、同一进程，仅因抓取结束就差 8.1%。** → **性能测试必须等 Manager 启动任务完成后再跑**（或关闭其启动抓取）。这也解释了本报告中若干"430 s+"的总时。
+
+#### 6.2.2 另一条纪律：重复测量必须改 seed
+
+ComfyUI 按输入缓存整图执行结果，**输入全不变时直接返回上次结果**（实测 `Prompt executed in 0.07 seconds`，一次采样都没跑）。改 `RandomNoise` 的 seed 是最干净的重复测量方式：**token 数不变（工作量恒定）**，且 seed 位于噪声节点，**不会失效上游 TE/VAE 缓存**（`got prompt → DiT 装载` 仍为 ~0.3 s）。
 
 ---
 
@@ -378,13 +455,13 @@ UnetLoaderGGUFAdvanced
 
 | 项 | 说明 |
 |---|---|
-| 段档决策抖动 | 已知机制（trim + 棘轮），但收益上限仅 ≈4%，暂不处理 |
-| `sol_attn` | 本分支缺原生 SM70 kernel（**上游 v2.0 已提供 `h3_v100_sol_cuda.pyd`**）→ 见第 10 节 |
-| 稀疏 flash 源码 | `flash_fwd_sparse_*` 在源码树中但未编译，待验证完整性 |
-| 非采样耗时 | 实测解码 62–92 s、装载与编码 0.35–99 s，与采样同量级 |
-| R2 / R7 离群 | 同 token 下偏离 20%+，未定位 |
-| **GGUF + DynamicVRAM** | **待验证**：`is_dynamic()` 能否通过（10 分钟实验，见 10.2） |
-| 上游 v2.0 迁移 | 需先完成 10.2 验证，再决定"整体升级"还是"只移植独立模块" |
+| ~~段档决策抖动~~ | **已结案**：段档不是成本驱动因素（见 §6.1），改动已回滚 |
+| ~~GGUF + DynamicVRAM~~ | **已结案**：loader 使 `is_dynamic()` 恒为 `False`；且 DynamicVRAM 与本节点冲突必崩（见 §10.2） |
+| `sol_attn` | 本分支缺原生 SM70 kernel（上游 v2.0 已提供 `h3_v100_sol_cuda.pyd`）→ 见 §10 |
+| 稀疏 flash 源码 | `flash_fwd_sparse_*` 在源码树中但未列入 `setup.py`，完整性未知 |
+| 非采样耗时 | 解码 62–92 s、装载与编码 0.24–99 s，与采样同量级 |
+| R1 残差 / T2 偏差 | R1 **+32 s/it**、T2 **+4.7%**，均未定位 |
+| 上游 v2.0 迁移 | 因上一条结论，整体升级不可行；如需 Sol 只能"移植独立模块"或自行实现原生 kernel |
 
 ---
 
@@ -405,31 +482,52 @@ UnetLoaderGGUFAdvanced
 
 v2.0 自带**四个**预编译扩展：`comfy_v100_flash_attn_cuda` / `h3_v100_mlp_cuda` / `h3_v100_qk_cuda` / **`h3_v100_sol_cuda`**；本分支只有第一个——这正是结论四的直接原因。
 
-### 10.2 最值得先验证的一条：**GGUF 可能并不需要这个分支**
+### 10.2 已验证：**GGUF 无法满足 `is_dynamic()`，且 DynamicVRAM 与本节点冲突**
 
-v2.0 的准入检查（`h3_optimize.py`）：
+> 本节先前给出过一个"10 分钟验证法"，**方向是错的**，已按实测更正。
+
+**① 准入检查查的是 patcher 类型，不是文件格式**
 
 ```python
+# 上游 v2.0 h3_optimize.py
 is_dynamic = getattr(configured, 'is_dynamic', None)
 if not callable(is_dynamic) or not bool(is_dynamic()):
-    raise RuntimeError('H3 V100 requires ComfyUI DynamicVRAM. '
-                       'Remove --disable-dynamic-vram and --lowvram, restart ComfyUI, and reload the model.')
+    raise RuntimeError('H3 V100 requires ComfyUI DynamicVRAM. ...')
 ```
 
-**它检查的是"模型 patcher 是否为 Dynamic 类型"，而不是"模型文件是否为 GGUF"。** 而 ComfyUI 仅在启用 DynamicVRAM 时才生成 Dynamic patcher。本分支 README 中"GGUF 模型不是 Dynamic 类型"的判断，很可能是在 `--disable-dynamic-vram --lowvram` 下得出的。
+`comfy/model_patcher.py`：`ModelPatcher.is_dynamic()` → `False`（L402）；`ModelPatcherDynamic.is_dynamic()` → `True`（L1791）。
 
-三条独立旁证：
+**② 但 GGUF loader 会把 patcher 无条件降级回普通类型**
 
-1. 上游 v2.0 `README_zh-CN.md` 的启动参数要求：**移除 `--disable-dynamic-vram`、移除 `--lowvram`**。
-2. ComfyUI 0.35 的启动日志本身即提示：*"If you use gguf we recommend keeping dynamic vram enabled"*。
-3. `V100优化方案.md` 中"16 G 必须 `--lowvram` + `--disable-dynamic-vram`"是 **0.29/0.33 时期**的结论，早于 0.35 的新内存栈。
+`custom_nodes/comfyui-gguf-loader/nodes.py`：
 
-⚠️ **仍未证实**：`UnetLoaderGGUFAdvanced`（CCTech 的 GGUF loader）是否参与 ComfyUI 的 dynamic 加载路径。自定义 loader 若自行构造 `ModelPatcher`，仍可能不满足 `is_dynamic()`。
+```python
+L37 : class GGUFModelPatcher(comfy.model_patcher.ModelPatcher)   # 普通子类，未重写 is_dynamic
+L132: def clone(self, *args, **kwargs):
+L133:     src_cls = self.__class__
+L134:     self.__class__ = GGUFModelPatcher      # ← 无条件降级
+L135:     n = super().clone(*args, **kwargs)
+L136:     n.__class__ = GGUFModelPatcher         # ← 克隆体也降级
+```
 
-**10 分钟验证法**：备份 `run_h3.bat` → 移除 `--disable-dynamic-vram` 与 `--lowvram` → **完全重启** → 用当前 v1.3.0 分支跑一次，观察是否仍报 `is_dynamic` 错误。
+**→ 无论开不开 DynamicVRAM，GGUF 模型经这个 loader 之后 `is_dynamic()` 恒为 `False`。** 上游 v1.4+/v2.0 因此**无法直接用于 GGUF**——本分支的存在是必要的（README 结论正确，原因应表述为"loader 强制 class 替换"，而非启动参数）。
 
-- 不报错 → 上游 v2.0 可直接用于 GGUF，本分支转为对照 / 回滚用途；
-- 仍报错 → 证明是 loader 侧不参与 dynamic，本分支继续存在。
+**③ 直接实验：DynamicVRAM + 本分支 = 必崩**
+
+移除 `--disable-dynamic-vram` 与 `--lowvram` 后（启动日志出现 `DynamicVRAM support detected and enabled`、`Set vram state to: NORMAL_VRAM`）：
+
+| 指标 | `--disable-dynamic-vram` | **DynamicVRAM 开启** |
+|---|---|---|
+| aimdo | 未加载 | `aimdo_setup_hooks: installing 6 hooks` |
+| **可用显存 eff** | 3641 MiB | **820 MiB**（TE 改为常驻 `cuda:0`、VAE 被 2677 MB staged） |
+| 段档 | 6144 × 4 | **640 × 38** |
+| 结果 | 正常 | **第一步崩**：`RuntimeError: aimdo memory compile error` |
+
+崩溃链：`comfy/model_prefetch.py:147` → `comfy_aimdo/malloc_graph.py:58` → `malloc_graph_pop`；前置信号 `Comfy model compiler graph breaks: 0, rogues: 19`。
+
+**机制**：0.35 的 Comfy Compiler / malloc graph 需要**记录并重放固定的分配序列**，而本节点的自适应 MLP 分块**每块的分配尺寸都在变** → 图无法编译。本节点的 runtime guard 只关闭 `prefetch_dynamic_vbars` / `NUM_STREAMS`，**管不到 malloc graph**（它由 `aimdo_enabled` 独立开启）。
+
+**结论**：`--lowvram` + `--disable-dynamic-vram` **不是可选项**——它们同时把 Comfy Compiler 关掉了，而这与本节点的工作方式互斥。上游 v2.0 之所以必须绑定 DynamicVRAM，是因为它**为那套栈重写**（原生 VBAR 流式，而非自适应分块）；两者不可混用。
 
 ### 10.3 真正值得借鉴的架构变化
 
@@ -453,6 +551,59 @@ if not callable(is_dynamic) or not bool(is_dynamic()):
 | `dual_*`、FP8 / ConvRot | 单卡 + Q4_K_M 用不上 | ❌ |
 
 **不建议**直接把 v2.0 合入本分支：它深度依赖 dynamic VBAR（而当前启动参数正把它关闭），等同于重写内存层。
+
+---
+
+## 11. 结论
+
+### 11.1 这次"0.35 升级后变慢"到底是什么
+
+**不是 ComfyUI 0.35 的问题，也不是本节点的问题。** 实测 21 次运行，本节点全部补丁正常挂载、未出现一次自身故障。变慢由三件事造成：
+
+| # | 真因 | 代价 | 处置 |
+|---|---|---|---|
+| 1 | 工作流里的 `ModelAttentionBackend`（ComfyUI 内置节点）静默覆盖本节点的注意力调度器 | 每步 **+20~25%** | **bypass / 删除** |
+| 2 | 工作流里的第三方闭源包 `TE-Speed-MiniMaxH3` 内嵌 0.33 版 H3 前向 | **必崩**（2 次），且自报 **0% 加速** | **bypass / 删除** |
+| 3 | ComfyUI-Manager 启动后 ~7 分钟的后台抓取与采样并发 | s/it 虚高 **~8%** | 等 `All startup tasks have been completed.` 再跑 |
+
+### 11.2 明确排除的（含两次自我更正）
+
+| 假说 | 否证 |
+|---|---|
+| ❌ **段档 / MLP 分块数是成本驱动因素** | 把段数从 10–14 降到 5，s/it 反而 **+9%**（42.77 → 46.62）；补丁已回滚 |
+| ❌ **可用显存 eff 是成本驱动因素** | `--reserve-vram 1.0` 使 eff **+534 MiB**（机制确认），s/it 无改善（42.56 → 44.56） |
+| ❌ **`sol_attn` 没效果是因为序列不够长** | 门槛是 4096 token（23845/31699/34706 均远超）；实测走纯 PyTorch 兜底，**慢 2.55×** |
+| ❌ **开 DynamicVRAM 对 GGUF 更好** | 与本节点自适应分块 + Comfy Compiler **冲突必崩**；且 GGUF loader 使 `is_dynamic()` 恒为 `False` |
+
+### 11.3 0.35 + GGUF + V100 的推荐配置
+
+```
+UnetLoaderGGUFAdvanced
+  └─ LoraLoaderModelOnly          ← 保留（加速 LoRA，与 TE/attention 无关）
+       └─ H3V100Optimize          ← 保留，attention_backend = flash_attn
+            └─ guider / scheduler
+```
+
+- **启动参数**：`--lowvram` + `--disable-dynamic-vram` **必须保留**（它们同时关掉了与本节点互斥的 Comfy Compiler）
+- **不要接**：`ModelAttentionBackend`、`TESpeedMiniMaxH3`、任何第三方 attention patcher（写同一个 key，互相覆盖）
+- **不要选**：`attention_backend = sol_attn`（本 build 无原生 kernel）
+- **测试纪律**：等 Manager 启动任务完成后再跑；重复测量改 seed；判定只看 `s/it`
+
+**实测水平**（4 步、GGUF Q4_K_M、4-step LoRA、V100 16 G）：
+
+| 0.3 MP × 10 s | 0.3 MP × 15 s | 0.4 MP × 10 s | 0.5 MP × 5 s |
+|---|---|---|---|
+| **42.56 s/it** / 采样 170 s | **77.31 s/it** / 308 s | **68.90 s/it** / 275 s | 42.77 s/it / 171 s |
+
+### 11.4 仍未解决
+
+| 项 | 状态 |
+|---|---|
+| R1（16242 token、26 段、eff 2133）残差 **+32 s/it** | 与段数、eff 都对不上，未定位 |
+| R8（42.56）与今天干净复测 T2（44.56）相差 **+4.7%** | 疑为温度/噪声量级，未验证 |
+| 稀疏注意力（Sol） | 本 build 无原生 kernel；上游 v2.0 有 `h3_v100_sol_cuda.pyd`，但需整体移植且需 DynamicVRAM |
+| `flash_fwd_sparse_*` | 源码在 `native/csrc` 中但未列入 `setup.py`，完整性未知 |
+| 非采样耗时 | 解码 62–92 s、装载与编码 0.24–99 s，与采样同量级，未优化 |
 
 ---
 
