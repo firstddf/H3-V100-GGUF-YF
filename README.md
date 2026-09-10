@@ -3,6 +3,8 @@
 MiniMax H3 的 NVIDIA V100 (SM70) 优化节点 —— **GGUF 支持版（基于官方 v1.3.x）**。
 
 > ⚠️ **本项目基于 [rwashy/H3-V100](https://github.com/rwashy/H3-V100) v1.3.x 基线修改，原作者：rwashy。感谢原作者的优秀工作！**
+>
+> 📄 **ComfyUI 0.35 兼容性与实测报告 → [`TEST_REPORT_0.35.md`](TEST_REPORT_0.35.md)**
 
 ## 为什么有这个分支
 
