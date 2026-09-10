@@ -32,9 +32,11 @@
 
 **成本几乎只由 token 数决定**：`s/it ≈ 6.05e-4·N + 4.95e-8·N²`（±5%）。因此**怎么调分辨率/时长，都比"少接一个多余节点"更划算**——删掉 203 一次就省 20~25%。
 
+> **为什么用 GGUF**：V100 没有 INT8 tensor core —— 实测 INT8 GEMM 只有 FP16 的 **0.63×**、权重还大 1.78×，FP8 直接不可用（`supports_fp8_compute=False`）。所以 **GGUF Q4_K_M 在这台卡上是最优格式，不是妥协**（见 §12）。
+>
 > **一句话**：这次"0.35 升级后变慢"是**工作流里多接的两个节点**（一个覆盖注意力、一个内嵌旧前向）造成的，外加一个测试环境陷阱（Manager 抓取）。H3-V100 与 0.35 本身没有问题。
 >
-> 全部 21 次运行的逐次数据见 §6，完整结论见 §11。
+> 全部 21 次运行的逐次数据见 §6，完整结论见 §11；两条已评估并关闭的岔路见 §12 / §13。
 
 ---
 
@@ -457,11 +459,12 @@ UnetLoaderGGUFAdvanced
 |---|---|
 | ~~段档决策抖动~~ | **已结案**：段档不是成本驱动因素（见 §6.1），改动已回滚 |
 | ~~GGUF + DynamicVRAM~~ | **已结案**：loader 使 `is_dynamic()` 恒为 `False`；且 DynamicVRAM 与本节点冲突必崩（见 §10.2） |
-| `sol_attn` | 本分支缺原生 SM70 kernel（上游 v2.0 已提供 `h3_v100_sol_cuda.pyd`）→ 见 §10 |
-| 稀疏 flash 源码 | `flash_fwd_sparse_*` 在源码树中但未列入 `setup.py`，完整性未知 |
+| ~~INT8 / FP8 格式~~ | **已结案**：V100 无 INT8 tensor core（实测仅 FP16 的 0.63×），FP8 不可用 → GGUF 才是最优（见 §12） |
+| ~~SolAttn-V100 稀疏路线~~ | **已结案**：短序列慢 5×，且与本节点 attention 槽位互斥（见 §13） |
+| 稀疏 flash 源码（本分支） | `flash_fwd_sparse_*` 在源码树中但未列入 `setup.py`，完整性未知（不影响使用） |
 | 非采样耗时 | 解码 62–92 s、装载与编码 0.24–99 s，与采样同量级 |
 | R1 残差 / T2 偏差 | R1 **+32 s/it**、T2 **+4.7%**，均未定位 |
-| 上游 v2.0 迁移 | 因上一条结论，整体升级不可行；如需 Sol 只能"移植独立模块"或自行实现原生 kernel |
+| 上游 v2.0 迁移 | 整体升级受 DynamicVRAM 限制不可行；如需 Sol，只能在长序列（S ≥ 50k）上重新评估独立插件 |
 
 ---
 
@@ -601,9 +604,111 @@ UnetLoaderGGUFAdvanced
 |---|---|
 | R1（16242 token、26 段、eff 2133）残差 **+32 s/it** | 与段数、eff 都对不上，未定位 |
 | R8（42.56）与今天干净复测 T2（44.56）相差 **+4.7%** | 疑为温度/噪声量级，未验证 |
-| 稀疏注意力（Sol） | 本 build 无原生 kernel；上游 v2.0 有 `h3_v100_sol_cuda.pyd`，但需整体移植且需 DynamicVRAM |
+| 稀疏注意力（Sol） | 本 build 无原生 kernel（§5）；本机另有带原生 SM70 kernel 的独立插件，已验证并**关闭** → 见 §13 |
 | `flash_fwd_sparse_*` | 源码在 `native/csrc` 中但未列入 `setup.py`，完整性未知 |
 | 非采样耗时 | 解码 62–92 s、装载与编码 0.24–99 s，与采样同量级，未优化 |
+| ~~INT8 / FP8 模型格式~~ | **已评估：V100 上更慢或不可用** → 见 §12 |
+| ~~SolAttn-V100 稀疏路线~~ | **已评估：短序列不划算 + 槽位互斥** → 见 §13 |
+
+---
+
+## 12. 为什么 V100 上 GGUF 是最优格式（格式对比实测）
+
+ComfyUI 0.35 启动日志会建议使用原生格式：
+
+> *"ComfyUI native formats like **fp8, int8 and w4a8** will be faster even if they are larger than your memory."*
+
+同一段还附了前提：*"If you are on nvidia **20 series and above** it is required that you update your pytorch to cu130"*。**这个建议对 V100（SM70）不成立**，原因在硬件。
+
+### 12.1 硬件能力对照
+
+| 能力 | V100 (SM70) | Turing+ (SM75) | Ada+ (SM89) |
+|---|---|---|---|
+| FP16 tensor core | ✅ 125 TFLOPS（峰值） | ✅ | ✅ |
+| **INT8 tensor core** | ❌ **没有**（INT8 TC 自 Turing 引入） | ✅ | ✅ |
+| FP8 | ❌ | ❌ | ✅ |
+
+本机实测（`comfy.model_management`）：
+
+```
+supports_int8_compute : True      # 可运行，但走 DP4A，不是 tensor core
+supports_fp8_compute  : False     # FP8 不可用
+supports_nvfp4_compute: False
+supports_mxfp8_compute: False
+torch._int_mm         : 可用（返回 int32）
+```
+
+### 12.2 GEMM 基准（H3 真实 fc1 形状 `[4096, 5376] × [5376, 28672]`，单次 1262.7 GFLOP）
+
+| 精度 | 耗时 | 吞吐 | 相对 FP16 |
+|---|---|---|---|
+| **FP16（tensor core）** | 14.03 ms | **90.0 TFLOPS** | 1.00× |
+| **INT8（`torch._int_mm`）** | 22.45 ms | **56.2 TOPS** | **0.63×（慢 1.6 倍）** |
+
+> FP16 已达 V100 峰值的 **72%** —— 说明本节点的 fp16 路径本身也已接近该硬件的实用上限（这也是"重写 kernel 现实收益只有 1.3–1.8×"的实证）。
+
+### 12.3 同一层的权重体积
+
+| 格式 | 体积 | 相对 |
+|---|---|---|
+| **Q4_K_M（~4.5 bit）** | **82.7 MB** | **1.00×** |
+| INT8 / FP8 | 147.0 MB | 1.78× |
+| FP16 | 294.0 MB | 3.56× |
+
+### 12.4 结论
+
+| 判断 | 依据 |
+|---|---|
+| **不要为 V100 换 INT8 / FP8 格式** | INT8 算力仅 0.63×，权重还大 1.78×；FP8 `supports_fp8_compute=False` 直接不可用 |
+| **GGUF 唯一的代价（在线反量化）实测仅 ~3.5%** | 见 `V100优化方案.md` 的实测结论 |
+| **GGUF Q4_K_M + 本节点的 fp16 混合精度 = 本机最优组合** | 体积最小 + 算力最高 + 反量化代价极小 |
+| INT8 会因体积变大而**加重显存压力** | §6.1 已验证显存状态主导波动 |
+| 上游 v2.0 的 `dual_gpu` 要求 FP8 / INT8-ConvRot 核心 | V100 上前者不可用，后者按基准更慢 |
+
+**一句话**："INT8/FP8 比 GGUF 快"只在 **Turing 及以后**成立。V100 没有 INT8 tensor core，所以在这台卡上 **GGUF Q4_K_M 不是妥协，而是最优解**；只有升级到 SM75+/SM89+ 时，原生格式 + DynamicVRAM 才会全面超越 GGUF —— 届时本分支也就可以退场。
+
+---
+
+## 13. 已评估并关闭：SolAttn-V100 稀疏注意力路线
+
+### 13.1 起因
+
+本节点（v1.3.0 build）的 `sol_attn` 模式**没有原生 kernel**（见 §5）：`.pyd` 中 `sol_prepare` 命中 **0** 次 → 永远回退纯 PyTorch 参考实现 → 实测慢 2.55×。
+
+但本机另有一个独立插件 **`ComfyUI-MiniMaxH3-SolAttn-V100` v1.2.2**（作者 aaalll12322），它**自带预编译的 SM70 稀疏 kernel**：
+
+```
+comfy_v100_solattn_cuda.cp312-win_amd64.pyd            974,848 B
+native/csrc/flash_attn/src/flash_fwd_sparse_hdim128_sm70.cu
+native/csrc/flash_attn/src/flash_fwd_sparse_kernel.h   (39 KB)
+```
+
+实测验证：`torch.ops.load_library(...)` → `torch.ops.comfy_v100_solattn_cuda.varlen_fwd_sparse` **存在 ✓**。
+但其 API 与本节点**完全不同**（本节点需要 `comfy_v100_flash_attn_cuda.sol_prepare`）→ 二者无法互相调用。
+
+### 13.2 实测结果（0.3 MP × 5 s，S = 12984，密度 37.2%）
+
+| 配置 | token | s/it | 按 §6.2 成本模型的合理水平 | 倍数 |
+|---|---|---|---|---|
+| **本节点（flash，纯 dense）** | 23845 | **42.56** | 42.6 | **1.00×** |
+| **SolAttn-V100（稀疏 + FP16Safe）** | 12984 | **80.92** | 16.2 | **≈5.0× 慢** |
+
+单位 token 耗时：**40.1 ms vs 10.4 ms（3.9 倍）**。
+
+### 13.3 三条原因 + 一条硬性限制
+
+1. **它用 FP16Safe 替代了本节点更省的混合精度**：`x/16` prescale + 熔断 + **fp32 重跑兜底**（触发即整层 4×）；本节点是 `fc1/fc2 FP16 + FP32 SwiGLU + fc2 scale=256`，设计上不发生。
+2. **它没有 MLP token 分块**：16 G 上极易进入"装得越满越慢"的状态 —— 同配置两次运行仅因装载状态不同，s/it 从 80.92 变成 **166.71（2 倍）**。
+3. **作者的基准在 S≈98512**（比本测试长 7.6 倍）：attention 是 N²，短序列上该栈的固定开销占比过高。
+4. **两者 attention 槽位硬性互斥**：`nodes.py:301-303` 检测到已有 `optimized_attention_override` 会直接 `raise` → **无法实现"本节点管 fp16 + 显存、SolAttn 只管 attention"的叠加**。
+
+### 13.4 处置
+
+**在当前配置（0.3 MP 级短序列 + GGUF + 16 G V100）下关闭此路线。**
+
+唯一值得将来重回的场景：**S ≥ 50000 token 的长序列**（attention 占比升到 ~70%+），且需先解决"无 MLP 分块"带来的显存问题。
+
+> 另注：上游 v2.0 自带 `h3_v100_sol_cuda.pyd` 与 `sol_minimum_gain_percent`（收益不达标不启用），但整体迁移受 DynamicVRAM 限制（见 §10.2）。
 
 ---
 
@@ -648,4 +753,31 @@ git remote add origin https://github.com/rwashy/H3-V100.git
 git fetch --depth 1 --filter=blob:none --no-tags origin refs/tags/v2.0.0
 git show FETCH_HEAD:RELEASE_NOTES.md
 git ls-tree -r --name-only FETCH_HEAD | Select-String '\.pyd$'   # => 四个扩展
+
+# INT8 vs FP16 GEMM 基准（§12 数据来源）—— H3 真实 fc1 形状
+$py = @'
+import torch, time
+torch.backends.cuda.matmul.allow_tf32 = False
+def bench(fn, iters=30):
+    for _ in range(5): fn()
+    torch.cuda.synchronize(); t0 = time.perf_counter()
+    for _ in range(iters): fn()
+    torch.cuda.synchronize(); return (time.perf_counter() - t0) / iters * 1000
+N, K, M = 4096, 5376, 28672
+x16 = torch.randn(N, K, dtype=torch.float16, device="cuda"); w16 = torch.randn(K, M, dtype=torch.float16, device="cuda")
+x8  = torch.randint(-128, 127, (N, K), dtype=torch.int8, device="cuda")
+w8  = torch.randint(-128, 127, (K, M), dtype=torch.int8, device="cuda")
+print("FP16:", bench(lambda: torch.matmul(x16, w16)), "ms")   # ~14.0 ms / 90 TFLOPS
+print("INT8:", bench(lambda: torch._int_mm(x8, w8)), "ms")    # ~22.5 ms / 56 TOPS
+'@
+$py | D:\mt-tool\ComfyUI\python_embeded\python.exe -
+
+# SolAttn-V100 是否自带原生 SM70 kernel（§13 数据来源）
+$py2 = @'
+import torch, glob, os
+p = r"D:\mt-tool\ComfyUI\ComfyUI\custom_nodes\ComfyUI-MiniMaxH3-SolAttn-V100"
+torch.ops.load_library(sorted(glob.glob(os.path.join(p, "comfy_v100_solattn_cuda*")))[0])
+print(hasattr(torch.ops.comfy_v100_solattn_cuda, "varlen_fwd_sparse"))   # => True
+'@
+$py2 | D:\mt-tool\ComfyUI\python_embeded\python.exe -
 ```
