@@ -11,11 +11,13 @@
 
 | 结论 | 判定 |
 |---|---|
-| **H3-V100 本体在 ComfyUI 0.35 上工作正常** | ✅ 全部补丁正常挂载，9 次运行通过 |
-| **`sol_attn` 路线在本安装上不可用** | ❌ 原生 SM70 Sol kernel 从未被编译进 `.pyd`，静默回退纯 PyTorch 参考实现，**慢 2.55×** |
+| **H3-V100 本体在 ComfyUI 0.35 上工作正常** | ✅ 全部补丁正常挂载；9 次完成运行，唯一 2 次崩溃均由 TE-Speed 造成（见结论三） |
 | **`ModelAttentionBackend`（ComfyUI 内置节点）会静默覆盖本节点的注意力后端** | ⚠️ 每步慢 **20–25%**，必须不要接 |
 | **第三方闭源包 `TE-Speed-MiniMaxH3` 与 0.35 不兼容** | ❌ 内嵌 0.33 版 H3 前向，撞上 0.35 的 `FinalLayer` 签名变更 → **必崩** |
-| **本节点在 0.35 上的实测最优** | 0.3MP×10s / 23845 token / 4 步：**42.56 s/it**，采样 170s，总时 247.24s |
+| **`sol_attn` 在本分支（v1.3.0 build）不可用** | ❌ 该 `.pyd` 未编译 Sol kernel → 静默回退纯 PyTorch 参考实现，**慢 2.55×**。**上游 v2.0 已提供 `h3_v100_sol_cuda.pyd`**（见第 10 节） |
+| **实测最优（0.3MP×10s / 23845 token / 4 步）** | **42.56 s/it**，采样 170s |
+| **实测最优（0.3MP×15s / 34706 token / 4 步）** | **77.31 s/it**，采样 308s |
+| **`capacity_guard_tokens = 31744` 不是总长度上限** | 它只是"单次不分块 MLP 分配"上限；超过即**强制分块**（34706 token 实测照常运行） |
 
 **一句话**：0.35 升级后"变慢"的主因不是 H3-V100，也不是 0.35 本身，而是**工作流里多接了两个会互相覆盖/不兼容的节点**。拆掉后恢复到当前最优。
 
@@ -37,7 +39,7 @@
 | 加速 LoRA | `minimax_h3_turbo_v4_step600_ema_pruned_comfyui.safetensors` @ strength 1.0 |
 | 采样 | `SamplerCustomAdvanced` + `BasicScheduler(beta, steps=4, denoise=1)` |
 | 文本编码器 | Qwen3VL-8B-Instruct-Q4_K_M.gguf（BooguTE，7587 MB）+ ClipProj v3 |
-| 工作负载 | ① 0.3 MP × 10 s = **23845 token**　② 0.4 MP × 10 s = **31699 token**　③ 30813 / 16242 token（早期实验）|
+| 工作负载 | ① 0.3 MP × 10 s = **23845 token**　② 0.3 MP × 15 s = **34706 token**　③ 0.4 MP × 10 s = **31699 token**　④ 30813 / 16242 token（早期实验）|
 
 > 注：`--disable-dynamic-vram` 会让 `comfy.memory_management.aimdo_enabled` 保持 `False`，因此 0.35 新增的 Comfy Compiler / malloc graph / dynamic VBAR prefetch **在本测试中全部未启用**。
 
@@ -237,20 +239,21 @@ if native is None:
                            "the PyTorch reference path is intentionally disabled. ...")
 ```
 
-### 澄清两个常见误解
+### 澄清三个易混的数字
 
 | 数字 | 含义 | 与 Sol 的关系 |
 |---|---|---|
-| `sol_min_tokens = 4096` | **Sol 的启用门槛** | 23845 / 31699 token **远超，Sol 确实启用了** |
-| `capacity_guard_tokens = 31744` | **MLP 分块**的实测 OOM 上限 | **与 Sol 无关** |
+| `sol_min_tokens = 4096` | **Sol 的启用门槛** | 23845 / 31699 / 34706 token **远超，Sol 确实启用了** |
+| `capacity_guard_tokens = 31744` | 单次**不分块** MLP 分配的实测上限（超出即强制分块，**不是长度上限**） | **与 Sol 无关** |
+| `threshold = 38000 tokens` | **QKV 分块**阈值（超出走 1024-token 分块 QKV，更省显存但更慢） | **与 Sol 无关** |
 
-**不要**为了"触发 Sol"去突破 32K —— 门槛是 4096。
+**不要**为了"触发 Sol"去突破 32K —— Sol 的门槛是 **4096**，而 31744 / 38000 都是别的机制的门槛。
 
 ### 处置
 
-- **不要使用 `sol_attn`**，保持 `flash_attn`。
-- 想让 Sol 可用，需要从零实现 `sol_prepare` + 融合 forward 的 SM70 CUDA kernel（`backend.py` 引用的算子目前只是"预期存在"）。工作量以周计，暂不做。
-- 顺带发现：`native/csrc/flash_attn/src/` 下有 `flash_fwd_sparse_hdim128_sm70.cu` / `flash_fwd_sparse_kernel.h` 等**稀疏 flash 源码，但未列入 `setup.py` 编译**——这是比 Sol 现实得多的方向，但未知是否完整。
+- **本分支不要使用 `sol_attn`**，保持 `flash_attn`。
+- **更正**：这不是"上游也没做"，而是**版本差**。上游 **v2.0.0 自带 `h3_v100_sol_cuda.cp312-win_amd64.pyd`**（原生 SM70 Sol kernel），并配套 `sol_native.py` / `fused_sol_speed.py` / `sol_calibration.py` / `sol_adaptive_policy.py` / `sol_adaptive_budget.py` / `sol_range.py`，且带 **`sol_minimum_gain_percent`（收益不达标就不启用）**——本次实测踩到的"Sol 反而更慢"正是它要防的问题。要做 Sol，正确路径是**升级/移植上游 v2.0 的原生实现**，而不是自研。
+- 顺带发现：`native/csrc/flash_attn/src/` 下有 `flash_fwd_sparse_hdim128_sm70.cu` / `flash_fwd_sparse_kernel.h` 等**稀疏 flash 源码，但未列入 `setup.py` 编译**——未知是否完整，但方向比自研 Sol 现实得多。
 
 ---
 
@@ -269,8 +272,13 @@ if native is None:
 | C2 | 21:10 | 23845 | 4→5 | V100 flash | **激活** | — | — | **崩**（56.0s） |
 | **R8** | 21:17 | 23845 | **4×6144** | V100 flash | **bypass** | **42.6** | **170s** | **247.2s** |
 | S1 | 21:20 | 23845 | 5×4864 | `sol_attn` | bypass | 108.3 | 433s | 509.7s |
+| **R9** | 21:40 | **34706** | **3×11776** | V100 flash | **bypass** | **77.3** | **308s** | **515.5s** |
 
-> ⚠️ **总时不可直接横向比较**：它包含 llama-yf 提示词、TE/VAE 装载与解码，且会被 ComfyUI 缓存命中与否污染（实测 `got prompt → DiT 装载` 在 0.35 s 与 98 s 之间波动）。**判定一律以 s/it 为准。**
+> ⚠️ **总时不可直接横向比较**：它包含 TE/VAE 装载与编码、解码，且会被 ComfyUI 缓存命中与否污染（实测 `got prompt → DiT 装载` 在 **0.35 s 与 ~99 s** 之间波动）。**判定一律以 s/it 为准。**
+
+> R9 的完整时间构成：pre-load（VAE+TE 装载与编码，因时长改变而上游重算）**99.4 s** → DiT 装载 13.4 s → **采样 308 s（60%）** → 解码 92.4 s。
+
+> R9 是本报告唯一触发 `selection_reason=balanced_measured_full_limit` 的运行（34706 token 已越过 `capacity_guard_tokens=31744`），说明**该阈值只强制分块，不阻止运行**。
 
 > R2 与 R7 相对同 token 的其它运行偏离较大（+27% / −20%），说明仍有未识别的变量（可能是 token 构成/工作流差异），仅作参考。
 
@@ -292,6 +300,37 @@ if native is None:
 2. **降档不可逆**：`_UPGRADE_STABLE_CALLS=3` 且要求 `budget_tokens >= selected + 1024`，而 `selected` 本身贴着 `budget_tokens` 取整 → 升级门槛结构性难以满足（日志中 `upgrade_candidate=None, upgrade_stable_calls=0/3` 恒定）。
 
 **但段档的时间代价很小**：R7（6 段）43.84 → R8（4 段）42.56，即 **≈0.6–0.8 s/it 每段**。在 42.5 s/it 的量级下，段档这一整个杠杆的上限只有 **≈4%**。因此**不建议**为此改动分块逻辑；仅需留意日志中的 `chunks=` 是否跳到两位数。
+
+### 6.2 扩展律：token 与耗时的关系（可用于规划）
+
+0.3 MP 下 token 与时长近似线性：
+
+```
+token ≈ 2145 + 2172 × 秒        # 0.3 MP
+（10 s → 23865，15 s → 34725；实测 23845 / 34706 ✓）
+```
+
+而每步耗时是**超线性**的。用两个 V100 flash 运行点（31699 → 68.9 s/it、23845 → 43.8 s/it）拟合：
+
+```
+s/it ≈ 8.22e-4 · N + 4.265e-8 · N²        （N = token）
+```
+
+在 15 s 运行点上外推得 **79.9 s/it，实测 77.31（误差 −3.2%）**，说明该式在 13k–35k token 区间可用：
+
+| 时长(0.3MP) | token | 预测 s/it | 实测 s/it | 采样 | 注意力占比 |
+|---|---|---|---|---|---|
+| 5 s | ~13005 | 17.9 | — | ~72s | ~40% |
+| 10 s | 23845 | 43.9 | **42.6** | 170s | ~55% |
+| **15 s** | **34706** | **79.9** | **77.3** | **308s** | **~66%** |
+| 20 s | ~45585 | 126 | — | ~504s | ~70% |
+
+**两个可直接用于决策的结论：**
+
+1. **注意力占比随长度单调上升**（40% → 55% → 66% → 70%）。序列越长，稀疏注意力（Sol）的潜在收益越大——本分支因缺原生 kernel 无法利用，而上游 v2.0 的原生实现正是为此准备（见第 10 节）。
+2. **15 s 是 0.3 MP 的性价比拐点**：时长 +50%（10 s → 15 s），采样从 170 s 涨到 308 s（**1.81×**）。再往上二次项将主导。
+
+> 二次项（`N²`）在 transformer 中只有注意力，因此可由拟合系数直接读出注意力占每步的比例；这也是判定"该不该上稀疏注意力"的依据。
 
 ---
 
@@ -340,10 +379,80 @@ UnetLoaderGGUFAdvanced
 | 项 | 说明 |
 |---|---|
 | 段档决策抖动 | 已知机制（trim + 棘轮），但收益上限仅 ≈4%，暂不处理 |
-| `sol_attn` | 缺原生 SM70 kernel，不可用；需要重写 CUDA 实现 |
+| `sol_attn` | 本分支缺原生 SM70 kernel（**上游 v2.0 已提供 `h3_v100_sol_cuda.pyd`**）→ 见第 10 节 |
 | 稀疏 flash 源码 | `flash_fwd_sparse_*` 在源码树中但未编译，待验证完整性 |
-| 非采样耗时 | 实测解码 ~62 s、装载/前处理波动大（0.35–98 s），与采样同量级 |
+| 非采样耗时 | 实测解码 62–92 s、装载与编码 0.35–99 s，与采样同量级 |
 | R2 / R7 离群 | 同 token 下偏离 20%+，未定位 |
+| **GGUF + DynamicVRAM** | **待验证**：`is_dynamic()` 能否通过（10 分钟实验，见 10.2） |
+| 上游 v2.0 迁移 | 需先完成 10.2 验证，再决定"整体升级"还是"只移植独立模块" |
+
+---
+
+## 10. 与上游 v2.0.0 的对照与可借鉴项
+
+> 来源：`rwashy/H3-V100` tag `v2.0.0`（`RELEASE_NOTES.md` 与源码）。本分支基线为 v1.3.0。
+
+### 10.1 上游 v2.0 的变化
+
+| 更新 | 对应文件 |
+|---|---|
+| 双卡 V100 | `dual_attention.py` `dual_gpu_plan.py` `dual_runtime.py` |
+| FP8 E4M3 scaled + INT8 ConvRot | `weight_profile.py` |
+| **SOL 升级**（Quality / Speed / Ultra / Manual） | `sol_native.py` `fused_sol_speed.py` `sol_calibration.py` `sol_adaptive_policy.py` `sol_adaptive_budget.py` `sol_range.py` |
+| **集成 EasyCache**（Off / Quality / Speed） | `h3_easycache.py` |
+| 双采 / latent 放大 / Sigma Refiner | `sampling_schedule.py` |
+| **显存与稳定性**（阶段切换、长序列、连续运行） | `native_dynamic_vbar.py` `phase_allocation.py` `phase_model_release.py` `runtime_memory.py` `block_lifetime.py` `embedding_lifetime.py` |
+
+v2.0 自带**四个**预编译扩展：`comfy_v100_flash_attn_cuda` / `h3_v100_mlp_cuda` / `h3_v100_qk_cuda` / **`h3_v100_sol_cuda`**；本分支只有第一个——这正是结论四的直接原因。
+
+### 10.2 最值得先验证的一条：**GGUF 可能并不需要这个分支**
+
+v2.0 的准入检查（`h3_optimize.py`）：
+
+```python
+is_dynamic = getattr(configured, 'is_dynamic', None)
+if not callable(is_dynamic) or not bool(is_dynamic()):
+    raise RuntimeError('H3 V100 requires ComfyUI DynamicVRAM. '
+                       'Remove --disable-dynamic-vram and --lowvram, restart ComfyUI, and reload the model.')
+```
+
+**它检查的是"模型 patcher 是否为 Dynamic 类型"，而不是"模型文件是否为 GGUF"。** 而 ComfyUI 仅在启用 DynamicVRAM 时才生成 Dynamic patcher。本分支 README 中"GGUF 模型不是 Dynamic 类型"的判断，很可能是在 `--disable-dynamic-vram --lowvram` 下得出的。
+
+三条独立旁证：
+
+1. 上游 v2.0 `README_zh-CN.md` 的启动参数要求：**移除 `--disable-dynamic-vram`、移除 `--lowvram`**。
+2. ComfyUI 0.35 的启动日志本身即提示：*"If you use gguf we recommend keeping dynamic vram enabled"*。
+3. `V100优化方案.md` 中"16 G 必须 `--lowvram` + `--disable-dynamic-vram`"是 **0.29/0.33 时期**的结论，早于 0.35 的新内存栈。
+
+⚠️ **仍未证实**：`UnetLoaderGGUFAdvanced`（CCTech 的 GGUF loader）是否参与 ComfyUI 的 dynamic 加载路径。自定义 loader 若自行构造 `ModelPatcher`，仍可能不满足 `is_dynamic()`。
+
+**10 分钟验证法**：备份 `run_h3.bat` → 移除 `--disable-dynamic-vram` 与 `--lowvram` → **完全重启** → 用当前 v1.3.0 分支跑一次，观察是否仍报 `is_dynamic` 错误。
+
+- 不报错 → 上游 v2.0 可直接用于 GGUF，本分支转为对照 / 回滚用途；
+- 仍报错 → 证明是 loader 侧不参与 dynamic，本分支继续存在。
+
+### 10.3 真正值得借鉴的架构变化
+
+| | v1.3（本分支） | v2.0 |
+|---|---|---|
+| 显存策略 | 经验性 chunk 档位选择 + `cache_trim` | **`NativeDynamicVBARPolicy` + `comfy_aimdo.model_vbar`**，原生动态 VBAR 流式权重 |
+| 本次实测到的症状 | 段档 3↔26 抖动、`trim` 反致降档、升级棘轮死锁、offload 量决定速度 | 阶段化资源协调（`phase_allocation` / `phase_model_release` / `runtime_memory` / 张量生命周期） |
+
+**"段档抖动"的正解方向在这里**：不是继续调 `_select_chunk_tokens` 的阈值（整个段档杠杆上限仅 ≈4%，见 6.1），而是把权重流式交给 0.35 原生的 VBAR。
+
+### 10.4 可单独移植的模块（若 10.2 验证不通过）
+
+| 模块 | 借鉴价值 | GGUF 可行性 |
+|---|---|---|
+| `h3_easycache.py` | 跨步缓存（Off/Quality/Speed，音视频分别保护） | **与权重格式无关，建议先试** |
+| `cast_failure_cleanup.py`、`lora_failure_guard.py` | cast / LoRA 失败后的清理与保护 | 独立模块，很可能可直接搬 |
+| `bounded_norm.py` | 数值有界 norm（防 NaN/Inf） | 独立，可搬 |
+| `sampling_schedule.py` | 8 步 Turbo LoRA 使用已验证的 Euler | 零成本借鉴 |
+| `mlp_native.py` / `qk_native.py` + 对应 `.pyd` | 原生 MLP / QK 算子 | 需 v2.0 Python 侧配套 |
+| `sol_*` 全套 + `h3_v100_sol_cuda.pyd` | 原生稀疏注意力（本分支最缺的一块） | 需整体搬迁，不宜拆 |
+| `dual_*`、FP8 / ConvRot | 单卡 + Q4_K_M 用不上 | ❌ |
+
+**不建议**直接把 v2.0 合入本分支：它深度依赖 dynamic VBAR（而当前启动参数正把它关闭），等同于重写内存层。
 
 ---
 
@@ -360,7 +469,9 @@ UnetLoaderGGUFAdvanced
 | `custom_nodes/H3_V100/h3_optimize.py:16,163` | `SOL_MIN_TOKENS = 4096`、`allow_sol = (attention_backend == MODE_SOL)` |
 | `custom_nodes/H3_V100/sol_attention.py:514,532-543` | native 尝试 → 纯 PyTorch 参考实现兜底 |
 | `custom_nodes/H3_V100/tokenwise_chunking.py:97-198` | 段档选择；`:262` trim；`:299-329` 棘轮 |
-| `custom_nodes/H3_V100/native/setup.py:33-37` | 只编译 4 个 flash attention 源 |
+| `custom_nodes/H3_V100/native/setup.py:33-37` | 只编译 4 个 flash attention 源（**不含 Sol**） |
+| 上游 v2.0 `h3_optimize.py`（tag `v2.0.0`） | `is_dynamic()` 准入检查与全部新参数（sol_* / easycache_* / dual_gpu） |
+| 上游 v2.0 预编译扩展 | `comfy_v100_flash_attn_cuda` / `h3_v100_mlp_cuda` / `h3_v100_qk_cuda` / **`h3_v100_sol_cuda`** |
 
 ## 附录 B：证据命令
 
@@ -377,4 +488,13 @@ $s=[Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes(
 $s=[Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes(
   'custom_nodes\H3_V100\comfy_v100_flash_attn_cuda.cp312-win_amd64.pyd'))
 "sol 出现次数: $(([regex]::Matches($s,'sol')).Count)"    # => 0
+
+# 查看上游 v2.0 源码（部分克隆：只取元数据，按需拉单个文件）
+New-Item -ItemType Directory temp_h3v100_v2 -Force | Out-Null
+Set-Location temp_h3v100_v2
+git init -q .
+git remote add origin https://github.com/rwashy/H3-V100.git
+git fetch --depth 1 --filter=blob:none --no-tags origin refs/tags/v2.0.0
+git show FETCH_HEAD:RELEASE_NOTES.md
+git ls-tree -r --name-only FETCH_HEAD | Select-String '\.pyd$'   # => 四个扩展
 ```
